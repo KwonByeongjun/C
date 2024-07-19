@@ -1,25 +1,3 @@
-'''
-Simulation setup
-
-Device size: 8GiB
-Logical size: 8GB (8GiB-8GB: OP)
-Page size: 4KB
-Block size: 4MB
-GC threshold: less than 2 free blocks
-
-Output: 출력 해야하는 정보
-
-8GB 마다:
-[Progress: 8GiB] WAF: 1.012, TMP_WAF: 1.024, Utilization: 1.000
-GROUP 0[2046]: 0.02 (ERASE: 1030)
-
-TMP_WAF: 0~50GiB, 50GiB~100GiB 동안의 WAF
-WAF: 지금까지의 WAF
-Utilization: LBA 기준으로 지금 얼마만큼 쓰였는가
-GROUP 0[Free block을 제외한 사용된 블록의 개수]: Valid data ratio on GC (50GiB) (50GiB 동안 발생한 ERASE 횟수)
-'''
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -31,9 +9,10 @@ GROUP 0[Free block을 제외한 사용된 블록의 개수]: Valid data ratio on
 #define TotalPages (TotalBlocks * PPB) // 전체 페이지 수
 #define BlockSize (PageSize * PPB) // 블록 크기 (4MB)
 #define DeviceSize (TotalBlocks * BlockSize) // 디바이스 크기 (8GiB)
-#define LogicalSize (8L * 1024 * 1024 * 1024) // 논리 크기 (8GB)
-#define GCBoundary (8L * 1024 * 1024 * 1024) // 8GB마다 통계 출력
+#define LogicalSize (8L * 1000 * 1000 * 1000) // 논리 크기 (8GB)
+#define GCBoundary (8L * 1000 * 1000 * 1000) // 8GB마다 통계 출력
 #define FreeBlockThreshold 2 // GC 임계값 (2개 미만의 블록)
+#define LAB_NUM (LogicalSize / PageSize) // LBA 수
 
 typedef struct {
     bool valid;
@@ -42,6 +21,8 @@ typedef struct {
 
 typedef struct {
     Page pages[PPB];
+    int freePageOffset; // 블록당 free page offset 유지
+    int validPageCount; // 블록당 valid page 수 유지
 } Block;
 
 typedef struct Node {
@@ -65,8 +46,8 @@ typedef struct {
 // 글로벌 변수들
 Block blocks[TotalBlocks];
 Queue freeBlocks;
-int mappingTable[TotalPages]; // 논리 -> 물리 매핑 테이블
-int OoBa[TotalPages]; // Out of Band area
+int mappingTable[LAB_NUM]; // 논리 -> 물리 매핑 테이블
+int OoBa[LAB_NUM]; // Out of Band area
 
 int current_active_block;
 int current_active_page;
@@ -75,6 +56,7 @@ unsigned long gc_written_data = 0;
 unsigned int tmp_erase_count = 0;
 unsigned long tmp_written_data = 0;
 unsigned int progress_boundary = 8;
+int remainFreeBlocks = 0;
 
 // Queue 함수들
 void initQueue(Queue *q) {
@@ -88,10 +70,13 @@ void enqueue(Queue *q, int blockId) {
     if (q->rear == NULL) {
         q->front = temp;
         q->rear = temp;
-        return;
     }
-    q->rear->next = temp;
-    q->rear = temp;
+    else {
+        q->rear->next = temp;
+        q->rear = temp;
+
+    }
+    remainFreeBlocks++;
 }
 
 int dequeue(Queue *q) {
@@ -105,6 +90,7 @@ int dequeue(Queue *q) {
         q->rear = NULL;
     }
     free(temp);
+    remainFreeBlocks--;
     return blockId;
 }
 
@@ -114,12 +100,14 @@ void initial() {
         for (int j = 0; j < PPB; j++) {
             blocks[i].pages[j].valid = false;
         }
+        blocks[i].freePageOffset = 0;
+        blocks[i].validPageCount = 0;
     }
     initQueue(&freeBlocks);
     for (int i = 0; i < TotalBlocks; i++) {
         enqueue(&freeBlocks, i);
     }
-    for (int i = 0; i < TotalPages; i++) {
+    for (int i = 0; i < LAB_NUM; i++) {
         mappingTable[i] = -1;
         OoBa[i] = -1;
     }
@@ -132,23 +120,14 @@ void initial() {
     progress_boundary = 8;
 }
 
-// 유효한 페이지 찾기
-int findFreePage(int blockId) {
-    for (int i = 0; i < PPB; i++) {
-        if (!blocks[blockId].pages[i].valid) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 // 페이지 쓰기
-void writePage(int blockId, int pageId, char *data, int LBA) {
-    int new_page = findFreePage(current_active_block);
-    if (new_page == -1) {
+void writePage(char *data, int LBA) {
+    int new_page = blocks[current_active_block].freePageOffset;
+    if (new_page >= PPB) {
         current_active_block = dequeue(&freeBlocks);
+        blocks[current_active_block].freePageOffset = 0;
         current_active_page = 0;
-        new_page = findFreePage(current_active_block);
+        new_page = blocks[current_active_block].freePageOffset;
     }
     int old_physical_address = mappingTable[LBA];
     if (old_physical_address != -1) {
@@ -156,11 +135,14 @@ void writePage(int blockId, int pageId, char *data, int LBA) {
         int old_page_id = old_physical_address % PPB;
         if (blocks[old_block_id].pages[old_page_id].valid) {
             blocks[old_block_id].pages[old_page_id].valid = false;
+            blocks[old_block_id].validPageCount--;
         }
     }
-    blocks[blockId].pages[pageId].valid = true;
+    blocks[current_active_block].pages[new_page].valid = true;
     mappingTable[LBA] = current_active_block * PPB + new_page;
     OoBa[current_active_block * PPB + new_page] = LBA;
+    blocks[current_active_block].freePageOffset++;
+    blocks[current_active_block].validPageCount++;
     current_active_page++;
     total_written_data += PageSize;
     tmp_written_data += PageSize;
@@ -171,19 +153,15 @@ void removeBlock(int blockId) {
     for (int i = 0; i < PPB; i++) {
         blocks[blockId].pages[i].valid = false;
     }
+    blocks[blockId].freePageOffset = 0;
+    blocks[blockId].validPageCount = 0;
     enqueue(&freeBlocks, blockId);
     tmp_erase_count++;
 }
 
 // GC 알고리즘
 int countValidPages(int blockId) {
-    int valid_page_count = 0;
-    for (int i = 0; i < PPB; i++) {
-        if (blocks[blockId].pages[i].valid) {
-            valid_page_count++;
-        }
-    }
-    return valid_page_count;
+    return blocks[blockId].validPageCount;
 }
 
 // GC 실행
@@ -191,24 +169,22 @@ void GC() {
     int victim_block = -1;
     int min_valid_pages = PPB;
     for (int i = 0; i < TotalBlocks; i++) {
-        int valid_pages = countValidPages(i);
-        if (valid_pages < min_valid_pages) {
-            min_valid_pages = valid_pages;
+        if (blocks[i].validPageCount < min_valid_pages && blocks[i].validPageCount > 0) {
+            min_valid_pages = blocks[i].validPageCount;
             victim_block = i;
         }
     }
     if (victim_block != -1) {
         for (int i = 0; i < PPB; i++) {
             if (blocks[victim_block].pages[i].valid) {
-                int new_page = findFreePage(current_active_block);
-                if (new_page == -1) {
+                int new_page = blocks[current_active_block].freePageOffset;
+                if (new_page >= PPB) {
                     current_active_block = dequeue(&freeBlocks);
+                    blocks[current_active_block].freePageOffset = 0;
                     current_active_page = 0;
-                    new_page = findFreePage(current_active_block);
+                    new_page = blocks[current_active_block].freePageOffset;
                 }
-                char copy_data[PageSize];
-                memcpy(copy_data, blocks[victim_block].pages[i].data, PageSize);
-                writePage(current_active_block, new_page, copy_data, OoBa[victim_block * PPB + i]);
+                writePage(blocks[victim_block].pages[i].data, OoBa[victim_block * PPB + i]);
                 gc_written_data += PageSize;
             }
         }
@@ -216,11 +192,10 @@ void GC() {
     }
 }
 
-
 void Statistics() {
-    double waf = (double)total_written_data / (double)LogicalSize;
-    double tmp_waf = (double)tmp_written_data / (double)(progress_boundary * 1024 * 1024 * 1024);
-    double utilization = (double)total_written_data / (double)DeviceSize;
+    double waf = (double)(total_written_data + gc_written_data) / (double)total_written_data;
+    double tmp_waf = (double)(tmp_written_data + gc_written_data) / (double)(progress_boundary * 1000 * 1000 * 1000);
+    double utilization = (double)(LAB_NUM - freeBlocks.rear->blockId) / (double)LAB_NUM;
     int used_blocks = TotalBlocks - freeBlocks.rear->blockId - 1;
     double valid_data_ratio = (double)gc_written_data / (double)(tmp_erase_count * BlockSize);
 
@@ -250,7 +225,7 @@ void processRequests(const char *filename) {
         }
         else if (request.io_type == 1) { 
             char data[PageSize] = {0}; 
-            writePage(current_active_block, current_active_page, data, request.lba); // WRITE
+            writePage(data, request.lba); // WRITE
         } 
         else if (request.io_type == 3) { 
             removeBlock(request.lba / PPB); // TRIM
@@ -258,7 +233,7 @@ void processRequests(const char *filename) {
 
         processed_data += request.size;
 
-        if (freeBlocks.rear == NULL || freeBlocks.rear->blockId < FreeBlockThreshold) {
+        if (remainFreeBlocks < FreeBlockThreshold) {
             GC();
         }
 
@@ -278,3 +253,5 @@ int main() {
     Statistics(); 
     return 0;
 }
+
+
