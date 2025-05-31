@@ -1,0 +1,308 @@
+// ======================================
+// client.c
+// ======================================
+
+#define _POSIX_C_SOURCE 200809L
+#include <arpa/inet.h>
+#include <cJSON/cJSON.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <time.h>
+
+#define BOARD 8
+
+// ────────────────────────────────────
+// board.c에 정의된 함수 원형(prototype)
+// ────────────────────────────────────
+int inb(int r, int c);
+int dist(int sr, int sc, int dr, int dc);
+void apply_move(char bd[BOARD][BOARD+1], int sr, int sc, int dr, int dc, char me);
+int score_diff(char bd[BOARD][BOARD+1], char me);
+void generate_move(char bd[BOARD][BOARD+1], char me, int *sx, int *sy, int *tx, int *ty);
+
+// ────────────────────────────────────
+// newline-framed JSON I/O 헬퍼
+// ────────────────────────────────────
+static int writeln(int fd, const char *s) {
+    size_t n = strlen(s);
+    if (write(fd, s, n) != (ssize_t)n) return -1;
+    return (write(fd, "\n", 1) == 1) ? 0 : -1;
+}
+
+static int send_json(int fd, cJSON *o) {
+    char *t = cJSON_PrintUnformatted(o);
+    int r = writeln(fd, t);
+    free(t);
+    return r;
+}
+
+static cJSON *recv_json(int fd) {
+    char buf[4096];
+    size_t p = 0;
+    while (read(fd, &buf[p], 1) == 1) {
+        if (buf[p++] == '\n') {
+            buf[p - 1] = '\0';
+            return cJSON_Parse(buf);
+        }
+        if (p >= sizeof(buf) - 1) break;
+    }
+    return NULL;
+}
+
+// ────────────────────────────────────
+// JSON 배열 → 2차원 char 배열(보드)로 변환
+// ────────────────────────────────────
+static void j2b(cJSON *arr, char bd[BOARD][BOARD+1]) {
+    for (int r = 0; r < BOARD; ++r) {
+        cJSON *row = cJSON_GetArrayItem(arr, r);
+        if (row && cJSON_IsString(row)) {
+            strncpy(bd[r], row->valuestring, BOARD);
+            bd[r][BOARD] = '\0';
+        } else {
+            memset(bd[r], '.', BOARD);
+            bd[r][BOARD] = '\0';
+        }
+    }
+}
+
+// ────────────────────────────────────
+// 터미널에 보드 출력 (디버깅용)
+// ────────────────────────────────────
+static void print_board(char bd[BOARD][BOARD+1]) {
+    for (int r = 0; r < BOARD; ++r) {
+        puts(bd[r]);
+    }
+}
+
+// ────────────────────────────────────
+// main 함수: 서버 연결, 메시지 루프, generate_move 호출
+// ────────────────────────────────────
+int main(int argc, char *argv[]) {
+    srand((unsigned)time(NULL));
+
+    if (argc != 7) {
+        fprintf(stderr, "usage: %s -ip <ip> -port <port> -username <name>\n", argv[0]);
+        return 1;
+    }
+
+    const char *ip = NULL, *name = NULL;
+    int port = 0;
+    for (int i = 1; i < argc; i += 2) {
+        if (strcmp(argv[i], "-ip") == 0) {
+            ip = argv[i + 1];
+        } else if (strcmp(argv[i], "-port") == 0) {
+            port = atoi(argv[i + 1]);
+        } else if (strcmp(argv[i], "-username") == 0) {
+            name = argv[i + 1];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+    if (!ip || port <= 0 || !name) {
+        fprintf(stderr, "All options -ip, -port, and -username must be provided.\n");
+        return 1;
+    }
+
+    // ────────────────────────────────────
+    // 1) 서버에 TCP 연결
+    // ────────────────────────────────────
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &sa.sin_addr);
+    if (connect(fd, (void *)&sa, sizeof(sa)) < 0) {
+        perror("connect failed");
+        return 1;
+    }
+
+    // ────────────────────────────────────
+    // 2) register 요청 및 응답 처리
+    // ────────────────────────────────────
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "type", "register");
+    cJSON_AddStringToObject(r, "username", name);
+    send_json(fd, r);
+    cJSON_Delete(r);
+
+    cJSON *ack = recv_json(fd);
+    if (!ack) {
+        fprintf(stderr, "서버로부터 응답을 받지 못했습니다. 연결이 끊겼거나 JSON 형식이 아닙니다.\n");
+        close(fd);
+        return 1;
+    }
+    cJSON *type_obj = cJSON_GetObjectItem(ack, "type");
+    if (!type_obj || !cJSON_IsString(type_obj)) {
+        fprintf(stderr, "등록 응답에서 'type' 항목을 찾을 수 없습니다.\n");
+        cJSON_Delete(ack);
+        close(fd);
+        return 1;
+    }
+    const char *tp_register = type_obj->valuestring;
+    if (strcmp(tp_register, "register_nack") == 0) {
+        cJSON *reason = cJSON_GetObjectItem(ack, "reason");
+        if (reason && cJSON_IsString(reason)) {
+            fprintf(stderr, "등록 실패: %s\n", reason->valuestring);
+        } else {
+            fprintf(stderr, "등록 실패: (사유 불명)\n");
+        }
+        cJSON_Delete(ack);
+        close(fd);
+        return 1;
+    } else if (strcmp(tp_register, "register_ack") != 0) {
+        fprintf(stderr, "예상치 못한 응답 type: %s\n", tp_register);
+        cJSON_Delete(ack);
+        close(fd);
+        return 1;
+    }
+    cJSON_Delete(ack);
+
+    // ────────────────────────────────────
+    // 3) 게임 메시지 루프 시작
+    // ────────────────────────────────────
+    char my_color = 'R';
+    while (1) {
+        cJSON *m = recv_json(fd);
+        if (!m) {
+            fprintf(stderr, "서버로부터 메시지를 받지 못했습니다. 연결이 끊겼거나 JSON 오류일 수 있습니다.\n");
+            break;
+        }
+
+        cJSON *type_item_m = cJSON_GetObjectItem(m, "type");
+        if (!type_item_m || !cJSON_IsString(type_item_m)) {
+            fprintf(stderr, "수신된 JSON에서 'type' 항목을 찾을 수 없습니다.\n");
+            cJSON_Delete(m);
+            break;
+        }
+        const char *tp2 = type_item_m->valuestring;
+
+        // ────────────────────────────────────
+        // game_start 메시지 처리
+        // ────────────────────────────────────
+        if (strcmp(tp2, "game_start") == 0) {
+            // players 정보 (선택적 출력)
+            cJSON *players_arr = cJSON_GetObjectItem(m, "players");
+            if (players_arr && cJSON_IsArray(players_arr)) {
+                printf("Players: ");
+                for (int i = 0; i < cJSON_GetArraySize(players_arr); ++i) {
+                    cJSON *p = cJSON_GetArrayItem(players_arr, i);
+                    if (p && cJSON_IsString(p)) {
+                        printf("%s ", p->valuestring);
+                    }
+                }
+                printf("\n");
+            }
+            // first_player 정보
+            cJSON *fp_item = cJSON_GetObjectItem(m, "first_player");
+            if (fp_item && cJSON_IsString(fp_item)) {
+                const char *fp = fp_item->valuestring;
+                my_color = (strcmp(fp, name) == 0) ? 'R' : 'B';
+                printf("First player: %s (내 색: %c)\n", fp, my_color);
+            }
+            // game_start에는 보통 board가 없으므로 경고만 출력
+            cJSON *board_arr = cJSON_GetObjectItem(m, "board");
+            if (board_arr && cJSON_IsArray(board_arr)) {
+                char bd[BOARD][BOARD + 1];
+                j2b(board_arr, bd);
+                print_board(bd);
+            } else {
+                fprintf(stderr, "[WARN] game_start에 'board'가 없습니다. 넘어갑니다.\n");
+            }
+        }
+        // ────────────────────────────────────
+        // your_turn 메시지 처리: generate_move() 호출
+        // ────────────────────────────────────
+        else if (strcmp(tp2, "your_turn") == 0) {
+            cJSON *board_arr = cJSON_GetObjectItem(m, "board");
+            if (!board_arr || !cJSON_IsArray(board_arr)) {
+                fprintf(stderr, "[ERROR] your_turn에 'board' 배열이 없습니다.\n");
+                cJSON_Delete(m);
+                break;
+            }
+            char bd[BOARD][BOARD + 1];
+            j2b(board_arr, bd);
+            // (디버깅용) 현재 보드 출력
+            print_board(bd);
+
+            // ────────────────────────────────────
+            // (☆) generate_move() 호출
+            // ────────────────────────────────────
+            int sx, sy, tx, ty;
+            generate_move(bd, my_color, &sx, &sy, &tx, &ty);
+            if (sx < 0) {
+                // 둘 곳이 없는 경우 모두 -1로 설정
+                sx = sy = tx = ty = -1;
+            }
+
+            // JSON으로 move 메시지 전송 (1-based 좌표)
+            cJSON *mv = cJSON_CreateObject();
+            cJSON_AddStringToObject(mv, "type", "move");
+            cJSON_AddNumberToObject(mv, "sx", sx + 1);
+            cJSON_AddNumberToObject(mv, "sy", sy + 1);
+            cJSON_AddNumberToObject(mv, "tx", tx + 1);
+            cJSON_AddNumberToObject(mv, "ty", ty + 1);
+            send_json(fd, mv);
+            cJSON_Delete(mv);
+        }
+        // ────────────────────────────────────
+        // move_ok 메시지 처리 (상대 또는 내 수가 정상 처리된 경우)
+        // ────────────────────────────────────
+        else if (strcmp(tp2, "move_ok") == 0) {
+            cJSON *player_item = cJSON_GetObjectItem(m, "player");
+            cJSON *sx_item = cJSON_GetObjectItem(m, "sx");
+            cJSON *sy_item = cJSON_GetObjectItem(m, "sy");
+            cJSON *tx_item = cJSON_GetObjectItem(m, "tx");
+            cJSON *ty_item = cJSON_GetObjectItem(m, "ty");
+            if (player_item && sx_item && sy_item && tx_item && ty_item) {
+                printf("자동 수 (%s) : %d %d → %d %d\n",
+                       player_item->valuestring,
+                       sx_item->valueint, sy_item->valueint,
+                       tx_item->valueint, ty_item->valueint);
+            }
+            cJSON *board_arr2 = cJSON_GetObjectItem(m, "board");
+            if (board_arr2 && cJSON_IsArray(board_arr2)) {
+                char bd2[BOARD][BOARD + 1];
+                j2b(board_arr2, bd2);
+                print_board(bd2);
+            }
+        }
+        // ────────────────────────────────────
+        // invalid_move 메시지 처리
+        // ────────────────────────────────────
+        else if (strcmp(tp2, "invalid_move") == 0) {
+            cJSON *player_item = cJSON_GetObjectItem(m, "player");
+            const char *pl = (player_item && cJSON_IsString(player_item))
+                                  ? player_item->valuestring
+                                  : "UNKNOWN";
+            printf("! incorrect move (%s)\n", pl);
+        }
+        // ────────────────────────────────────
+        // game_over 메시지 처리
+        // ────────────────────────────────────
+        else if (strcmp(tp2, "game_over") == 0) {
+            cJSON *scores_obj = cJSON_GetObjectItem(m, "scores");
+            if (scores_obj && cJSON_IsObject(scores_obj)) {
+                cJSON *r_sc_item = cJSON_GetObjectItem(scores_obj, "Red");
+                cJSON *b_sc_item = cJSON_GetObjectItem(scores_obj, "Blue");
+                int r_sc = (r_sc_item && cJSON_IsNumber(r_sc_item)) ? r_sc_item->valueint : 0;
+                int b_sc = (b_sc_item && cJSON_IsNumber(b_sc_item)) ? b_sc_item->valueint : 0;
+                printf("=== score ===\nRed : %d\nBlue: %d\n승자: %s\n",
+                       r_sc, b_sc,
+                       (r_sc > b_sc) ? "Red" : (b_sc > r_sc) ? "Blue" : "무승부");
+            }
+            cJSON_Delete(m);
+            break;
+        }
+        // ────────────────────────────────────
+        // 그 외 알 수 없는 메시지는 무시
+        // ────────────────────────────────────
+        cJSON_Delete(m);
+    }
+
+    close(fd);
+    return 0;
+}
