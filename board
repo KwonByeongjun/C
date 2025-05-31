@@ -1,0 +1,137 @@
+// ======================================
+// board.c
+// ======================================
+
+#include <stdlib.h>
+#include <string.h>
+
+#define BOARD 8
+
+/**
+ * 보드 범위(r,c)가 0 이상 BOARD-1 이하인지 검사
+ */
+int inb(int r, int c) {
+    return (r >= 0 && r < BOARD && c >= 0 && c < BOARD);
+}
+
+/**
+ * (sr,sc) -> (dr,dc) 이동 거리를 Chebyshev 거리로 계산
+ */
+int dist(int sr, int sc, int dr, int dc) {
+    int d1 = abs(dr - sr);
+    int d2 = abs(dc - sc);
+    return (d1 > d2) ? d1 : d2;
+}
+
+/**
+ * 보드 bd 에서, (sr,sc) 위치에 있는 말을 me('R' 또는 'B')가 (dr,dc)로 이동했을 때
+ * - 이동(복제 or 점프) 규칙에 따라 실제 보드를 업데이트
+ * - 복제(격차=1)인 경우: 원래 (sr,sc) 칸도 유지
+ * - 점프(격차=2)인 경우: 원래 (sr,sc)을 빈칸('.')으로 만듦
+ * - 그리고 이동 후, (dr,dc) 주변 8방향에 상대편 돌이 있으면 모두 내 돌로 뒤집음 
+ */
+void apply_move(char bd[BOARD][BOARD+1], int sr, int sc, int dr, int dc, char me) {
+    int d = dist(sr, sc, dr, dc);
+    // 1) (dr,dc) 위치에 내 돌 찍기
+    bd[dr][dc] = me;
+    // 2) 점프(격차=2)라면 원래 위치를 빈칸으로
+    if (d == 2) {
+        bd[sr][sc] = '.';
+    }
+    // 3) 인접 8방향에 상대 돌이 있으면 뒤집기
+    for (int rr = -1; rr <= 1; ++rr) {
+        for (int cc = -1; cc <= 1; ++cc) {
+            if (rr == 0 && cc == 0) continue;
+            int nr = dr + rr;
+            int nc = dc + cc;
+            if (inb(nr, nc) && bd[nr][nc] != '.' && bd[nr][nc] != me) {
+                bd[nr][nc] = me;
+            }
+        }
+    }
+}
+
+/**
+ * 현재 보드 bd 상의 돌 개수를 세어, 
+ * 내 돌(me) 개수 - 상대 돌 개수 를 리턴
+ */
+int score_diff(char bd[BOARD][BOARD+1], char me) {
+    int my = 0, op = 0;
+    char opp = (me == 'R') ? 'B' : 'R';
+    for (int r = 0; r < BOARD; ++r) {
+        for (int c = 0; c < BOARD; ++c) {
+            if (bd[r][c] == me)       ++my;
+            else if (bd[r][c] == opp) ++op;
+        }
+    }
+    return my - op;
+}
+
+/**
+ * generate_move:
+ *   현재 보드 bd 와 내 색(me)이 주어졌을 때,
+ *   가능한 모든 이동을 시뮬레이션한 뒤
+ *   "score_diff"가 가장 큰 이동을 찾아서 (sx,sy)->(tx,ty) 로 리턴.
+ *   만약 둘 수 있는 곳이 하나도 없으면 sx=-1 으로 표시.
+ *   동점일 경우 약간의 무작위성을 넣어 균형 잡음 (rand()%2 == 1).
+ *
+ *   - bd:   현재 8×8 보드 (각 행은 null-terminated 문자열, 길이는 8)
+ *   - me:   'R' 또는 'B'
+ *   - sx,sy,tx,ty: 이동 전/후 좌표(0-based row/col)를 리턴
+ */
+void generate_move(char bd[BOARD][BOARD+1], char me, int *sx, int *sy, int *tx, int *ty) {
+    int best_sx = -1, best_sy = -1, best_tx = -1, best_ty = -1;
+    int best_sc = -1000;  // 초기값을 충분히 낮게 잡음
+
+    // 1) 보드 전체 순회하며, 내 돌(me)이 있는 위치 (sr,sc)를 찾는다
+    for (int sr = 0; sr < BOARD; ++sr) {
+        for (int sc = 0; sc < BOARD; ++sc) {
+            if (bd[sr][sc] != me) continue;
+
+            // 2) 그 돌에서 dr,dc ∈ [-2..2] 범위로 이동 가능한지 확인
+            for (int dr = -2; dr <= 2; ++dr) {
+                for (int dc = -2; dc <= 2; ++dc) {
+                    int tr = sr + dr;
+                    int tc = sc + dc;
+                    //  - 보드 안에 들어오는지
+                    //  - dr==0 && dc==0 은 이동이 아니므로 skip
+                    //  - dist(sr,sc → tr,tc) > 2 이면 skip
+                    if (!inb(tr, tc) || (dr == 0 && dc == 0) || dist(sr, sc, tr, tc) > 2)
+                        continue;
+                    //  - 직선, 대각선 방향이 아니면 skip
+                    if (!(dr == 0 || dc == 0 || abs(dr) == abs(dc)))
+                        continue;
+                    //  - 목표 칸이 빈칸('.')이 아닌 경우 skip
+                    if (bd[tr][tc] != '.')
+                        continue;
+
+                    // 3) 실제 이동을 시뮬레이션 (임시 보드에 복사 후 apply_move)
+                    char tmp[BOARD][BOARD + 1];
+                    memcpy(tmp, bd, sizeof(tmp));
+                    apply_move(tmp, sr, sc, tr, tc, me);
+
+                    // 4) apply_move 후, score_diff 계산
+                    int diff = score_diff(tmp, me);
+
+                    // 5) 최댓값으로 갱신
+                    if (diff > best_sc) {
+                        best_sc = diff;
+                        best_sy = sr; best_sx = sc;
+                        best_ty = tr; best_tx = tc;
+                    }
+                    // 6) 동점일 때 약간의 랜덤 요소
+                    else if (diff == best_sc && (rand() % 2 == 1)) {
+                        best_sy = sr; best_sx = sc;
+                        best_ty = tr; best_tx = tc;
+                    }
+                }
+            }
+        }
+    }
+
+    // 만약 이동 가능한 게 하나도 없으면 best_sx == -1 상태 그대로
+    *sx = best_sx;
+    *sy = best_sy;
+    *tx = best_tx;
+    *ty = best_ty;
+}
