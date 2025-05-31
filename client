@@ -1,308 +1,777 @@
-// ======================================
+// ====================================================================================
 // client.c
-// ======================================
+//
+// 백혈구 전쟁 AI: “복제(Clone) 후보 3개 + 점프(Jump) 후보 3개 = 총 6개 후보를
+// 짧은 몬테카를로(run_quick_mcts)로 비교하여 최종 수를 결정”하는 전체 코드
+//
+// 컴파일 예시:
+//   gcc client.c -o client -lm
+//   (단, math.h와 stdlib.h, string.h 등이 필요하므로 -lm 옵션 포함)
+// ====================================================================================
 
-#define _POSIX_C_SOURCE 200809L
-#include <arpa/inet.h>
-#include <cJSON/cJSON.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <time.h>
+#include <math.h>
 
-#define BOARD 8
+#define BOARD_N 8
+#define MAX_CANDS 200        // 복제+점프 후보 합쳐서 최대치
+#define TOP_K 3              // Clone/Jump별로 상위 3개씩 뽑음
+#define SIMS_PER_CAND 50     // 후보당 몬테카를로 시뮬레이션 횟수
 
-// ────────────────────────────────────
-// board.c에 정의된 함수 원형(prototype)
-// ────────────────────────────────────
-int inb(int r, int c);
-int dist(int sr, int sc, int dr, int dc);
-void apply_move(char bd[BOARD][BOARD+1], int sr, int sc, int dr, int dc, char me);
-int score_diff(char bd[BOARD][BOARD+1], char me);
-void generate_move(char bd[BOARD][BOARD+1], char me, int *sx, int *sy, int *tx, int *ty);
+typedef struct {
+    int sr, sc;       // 시작 좌표 (source row/col)
+    int tr, tc;       // 목표 좌표 (target row/col)
+    double score;     // 그리디 휴리스틱 점수
+    double winrate;   // 몬테카를로로 계산된 승률
+    char move_type;   // 'C' = Clone, 'J' = Jump
+} MoveCandidate;
 
-// ────────────────────────────────────
-// newline-framed JSON I/O 헬퍼
-// ────────────────────────────────────
-static int writeln(int fd, const char *s) {
-    size_t n = strlen(s);
-    if (write(fd, s, n) != (ssize_t)n) return -1;
-    return (write(fd, "\n", 1) == 1) ? 0 : -1;
+typedef struct {
+    int sr, sc, tr, tc;
+    char move_type;   // 'C' 혹은 'J'
+} Move;
+
+// 전역 변수 (보드, 내/상대 색)
+char board[BOARD_N][BOARD_N];
+char my_color, opp_color;
+
+// 8방향(복제) 델타
+const int dr8[8]  = { -1,-1,-1, 0, 0, 1, 1, 1 };
+const int dc8[8]  = { -1, 0, 1,-1, 1,-1, 0, 1 };
+// 점프(거리 ≤ 2, 맨해튼 거리) 델타 12개
+const int dr_jump[12] = { -2,-2,-1,-1,-1, 0, 0, 1, 1, 1, 2, 2 };
+const int dc_jump[12] = { -1, 1,-2, 0, 2,-2, 2,-2, 0, 2,-1, 1 };
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 함수 원형 선언
+// ──────────────────────────────────────────────────────────────────────────
+int in_bounds(int r, int c);
+void apply_move(char bd[BOARD_N][BOARD_N], int sr, int sc, int tr, int tc, char color);
+int is_terminal(char bd[BOARD_N][BOARD_N]);
+char decide_winner(char bd[BOARD_N][BOARD_N]);
+void pick_random_or_heuristic(char bd[BOARD_N][BOARD_N], char turn,
+                              int *out_sr, int *out_sc, int *out_tr, int *out_tc);
+double run_quick_mcts(char bd[BOARD_N][BOARD_N], char player,
+                      int sr, int sc, int tr, int tc, int sims);
+int find_immediate_win_move(char bd[BOARD_N][BOARD_N], char player,
+                            int *out_sr, int *out_sc, int *out_tr, int *out_tc);
+int find_immediate_block_move(char bd[BOARD_N][BOARD_N], char player,
+                              int *out_sr, int *out_sc, int *out_tr, int *out_tc);
+
+double score_greedy_clone(char bd[BOARD_N][BOARD_N], int sr, int sc, int tr, int tc, char player);
+double score_greedy_jump(char bd[BOARD_N][BOARD_N], int sr, int sc, int tr, int tc, char player);
+Move generate_move(char bd[BOARD_N][BOARD_N], char player);
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 1) in_bounds: 좌표가 보드 내부인지 검사
+// ──────────────────────────────────────────────────────────────────────────
+int in_bounds(int r, int c) {
+    return (r >= 0 && r < BOARD_N && c >= 0 && c < BOARD_N);
 }
 
-static int send_json(int fd, cJSON *o) {
-    char *t = cJSON_PrintUnformatted(o);
-    int r = writeln(fd, t);
-    free(t);
-    return r;
-}
 
-static cJSON *recv_json(int fd) {
-    char buf[4096];
-    size_t p = 0;
-    while (read(fd, &buf[p], 1) == 1) {
-        if (buf[p++] == '\n') {
-            buf[p - 1] = '\0';
-            return cJSON_Parse(buf);
-        }
-        if (p >= sizeof(buf) - 1) break;
+// ──────────────────────────────────────────────────────────────────────────
+// 2) apply_move: Clone/Jump한 뒤, 주변 뒤집기(Reverse Conversion) 적용
+// ──────────────────────────────────────────────────────────────────────────
+void apply_move(char bd[BOARD_N][BOARD_N], int sr, int sc, int tr, int tc, char color) {
+    int dist = abs(tr - sr) + abs(tc - sc);
+    if (dist == 1) {
+        // Clone
+        bd[tr][tc] = color;
+    } else {
+        // Jump
+        bd[sr][sc] = '.';
+        bd[tr][tc] = color;
     }
-    return NULL;
+    // 주변 뒤집기
+    char opp = (color == 'R' ? 'B' : 'R');
+    for (int d = 0; d < 8; d++) {
+        int rr = tr + dr8[d], cc = tc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == opp) {
+            bd[rr][cc] = color;
+        }
+    }
 }
 
-// ────────────────────────────────────
-// JSON 배열 → 2차원 char 배열(보드)로 변환
-// ────────────────────────────────────
-static void j2b(cJSON *arr, char bd[BOARD][BOARD+1]) {
-    for (int r = 0; r < BOARD; ++r) {
-        cJSON *row = cJSON_GetArrayItem(arr, r);
-        if (row && cJSON_IsString(row)) {
-            strncpy(bd[r], row->valuestring, BOARD);
-            bd[r][BOARD] = '\0';
+
+// ──────────────────────────────────────────────────────────────────────────
+// 3) is_terminal: 보드에 빈 칸이 없거나, 더 이상 뒤집기가 불가능하면 종료
+//    (간단히 빈 칸 유무만 검사)
+// ──────────────────────────────────────────────────────────────────────────
+int is_terminal(char bd[BOARD_N][BOARD_N]) {
+    for (int i = 0; i < BOARD_N; i++) {
+        for (int j = 0; j < BOARD_N; j++) {
+            if (bd[i][j] == '.') return 0;
+        }
+    }
+    return 1;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 4) decide_winner: 돌 개수를 세고, 더 많은 쪽 리턴
+// ──────────────────────────────────────────────────────────────────────────
+char decide_winner(char bd[BOARD_N][BOARD_N]) {
+    int countR = 0, countB = 0;
+    for (int i = 0; i < BOARD_N; i++) {
+        for (int j = 0; j < BOARD_N; j++) {
+            if (bd[i][j] == 'R') countR++;
+            else if (bd[i][j] == 'B') countB++;
+        }
+    }
+    if (countR > countB) return 'R';
+    if (countB > countR) return 'B';
+    return '.';  // 동점인 경우
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 5) pick_random_or_heuristic: MCTS용 플레이라웃
+//    - 즉시 승리/즉시 차단 우선
+//    - 아니면 랜덤 Clone/Jump 시도
+// ──────────────────────────────────────────────────────────────────────────
+void pick_random_or_heuristic(char bd[BOARD_N][BOARD_N], char turn,
+                              int *out_sr, int *out_sc, int *out_tr, int *out_tc) {
+    // (1) 즉시 승리
+    {
+        if (find_immediate_win_move(bd, turn, out_sr, out_sc, out_tr, out_tc)) {
+            return;
+        }
+    }
+    // (2) 즉시 차단
+    {
+        if (find_immediate_block_move(bd, turn, out_sr, out_sc, out_tr, out_tc)) {
+            return;
+        }
+    }
+    // (3) 랜덤 Clone 또는 Jump 시도 (최대 1000번 트라이)
+    int tries = 0;
+    while (tries < 1000) {
+        int sr = rand() % BOARD_N;
+        int sc = rand() % BOARD_N;
+        if (bd[sr][sc] != turn) {
+            tries++;
+            continue;
+        }
+        int choice = rand() % 2;  // 0 = Clone, 1 = Jump
+        if (choice == 0) {
+            int d = rand() % 8;
+            int tr = sr + dr8[d];
+            int tc = sc + dc8[d];
+            if (in_bounds(tr, tc) && bd[tr][tc] == '.') {
+                *out_sr = sr; *out_sc = sc;
+                *out_tr = tr; *out_tc = tc;
+                return;
+            }
         } else {
-            memset(bd[r], '.', BOARD);
-            bd[r][BOARD] = '\0';
+            int j = rand() % 12;
+            int tr = sr + dr_jump[j];
+            int tc = sc + dc_jump[j];
+            if (in_bounds(tr, tc) && bd[tr][tc] == '.') {
+                *out_sr = sr; *out_sc = sc;
+                *out_tr = tr; *out_tc = tc;
+                return;
+            }
+        }
+        tries++;
+    }
+    // (4) 못 찾으면, 첫 번째 빈 칸으로 Clone
+    for (int sr = 0; sr < BOARD_N; sr++) {
+        for (int sc = 0; sc < BOARD_N; sc++) {
+            if (bd[sr][sc] != turn) continue;
+            for (int d = 0; d < 8; d++) {
+                int tr = sr + dr8[d];
+                int tc = sc + dc8[d];
+                if (in_bounds(tr, tc) && bd[tr][tc] == '.') {
+                    *out_sr = sr; *out_sc = sc;
+                    *out_tr = tr; *out_tc = tc;
+                    return;
+                }
+            }
         }
     }
+    // 그래도 못 찾으면 아무것도 안 하고 반환(절대 안 일어남)
+    *out_sr = *out_sc = *out_tr = *out_tc = 0;
 }
 
-// ────────────────────────────────────
-// 터미널에 보드 출력 (디버깅용)
-// ────────────────────────────────────
-static void print_board(char bd[BOARD][BOARD+1]) {
-    for (int r = 0; r < BOARD; ++r) {
-        puts(bd[r]);
-    }
-}
 
-// ────────────────────────────────────
-// main 함수: 서버 연결, 메시지 루프, generate_move 호출
-// ────────────────────────────────────
-int main(int argc, char *argv[]) {
-    srand((unsigned)time(NULL));
-
-    if (argc != 7) {
-        fprintf(stderr, "usage: %s -ip <ip> -port <port> -username <name>\n", argv[0]);
-        return 1;
-    }
-
-    const char *ip = NULL, *name = NULL;
-    int port = 0;
-    for (int i = 1; i < argc; i += 2) {
-        if (strcmp(argv[i], "-ip") == 0) {
-            ip = argv[i + 1];
-        } else if (strcmp(argv[i], "-port") == 0) {
-            port = atoi(argv[i + 1]);
-        } else if (strcmp(argv[i], "-username") == 0) {
-            name = argv[i + 1];
-        } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            return 1;
-        }
-    }
-    if (!ip || port <= 0 || !name) {
-        fprintf(stderr, "All options -ip, -port, and -username must be provided.\n");
-        return 1;
-    }
-
-    // ────────────────────────────────────
-    // 1) 서버에 TCP 연결
-    // ────────────────────────────────────
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in sa = {0};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &sa.sin_addr);
-    if (connect(fd, (void *)&sa, sizeof(sa)) < 0) {
-        perror("connect failed");
-        return 1;
-    }
-
-    // ────────────────────────────────────
-    // 2) register 요청 및 응답 처리
-    // ────────────────────────────────────
-    cJSON *r = cJSON_CreateObject();
-    cJSON_AddStringToObject(r, "type", "register");
-    cJSON_AddStringToObject(r, "username", name);
-    send_json(fd, r);
-    cJSON_Delete(r);
-
-    cJSON *ack = recv_json(fd);
-    if (!ack) {
-        fprintf(stderr, "서버로부터 응답을 받지 못했습니다. 연결이 끊겼거나 JSON 형식이 아닙니다.\n");
-        close(fd);
-        return 1;
-    }
-    cJSON *type_obj = cJSON_GetObjectItem(ack, "type");
-    if (!type_obj || !cJSON_IsString(type_obj)) {
-        fprintf(stderr, "등록 응답에서 'type' 항목을 찾을 수 없습니다.\n");
-        cJSON_Delete(ack);
-        close(fd);
-        return 1;
-    }
-    const char *tp_register = type_obj->valuestring;
-    if (strcmp(tp_register, "register_nack") == 0) {
-        cJSON *reason = cJSON_GetObjectItem(ack, "reason");
-        if (reason && cJSON_IsString(reason)) {
-            fprintf(stderr, "등록 실패: %s\n", reason->valuestring);
-        } else {
-            fprintf(stderr, "등록 실패: (사유 불명)\n");
-        }
-        cJSON_Delete(ack);
-        close(fd);
-        return 1;
-    } else if (strcmp(tp_register, "register_ack") != 0) {
-        fprintf(stderr, "예상치 못한 응답 type: %s\n", tp_register);
-        cJSON_Delete(ack);
-        close(fd);
-        return 1;
-    }
-    cJSON_Delete(ack);
-
-    // ────────────────────────────────────
-    // 3) 게임 메시지 루프 시작
-    // ────────────────────────────────────
-    char my_color = 'R';
-    while (1) {
-        cJSON *m = recv_json(fd);
-        if (!m) {
-            fprintf(stderr, "서버로부터 메시지를 받지 못했습니다. 연결이 끊겼거나 JSON 오류일 수 있습니다.\n");
-            break;
-        }
-
-        cJSON *type_item_m = cJSON_GetObjectItem(m, "type");
-        if (!type_item_m || !cJSON_IsString(type_item_m)) {
-            fprintf(stderr, "수신된 JSON에서 'type' 항목을 찾을 수 없습니다.\n");
-            cJSON_Delete(m);
-            break;
-        }
-        const char *tp2 = type_item_m->valuestring;
-
-        // ────────────────────────────────────
-        // game_start 메시지 처리
-        // ────────────────────────────────────
-        if (strcmp(tp2, "game_start") == 0) {
-            // players 정보 (선택적 출력)
-            cJSON *players_arr = cJSON_GetObjectItem(m, "players");
-            if (players_arr && cJSON_IsArray(players_arr)) {
-                printf("Players: ");
-                for (int i = 0; i < cJSON_GetArraySize(players_arr); ++i) {
-                    cJSON *p = cJSON_GetArrayItem(players_arr, i);
-                    if (p && cJSON_IsString(p)) {
-                        printf("%s ", p->valuestring);
+// ──────────────────────────────────────────────────────────────────────────
+// 6) find_immediate_win_move: “한 수만 더 두면 5목 완성” 검사
+// ──────────────────────────────────────────────────────────────────────────
+int find_immediate_win_move(char bd[BOARD_N][BOARD_N], char player,
+                            int *out_sr, int *out_sc, int *out_tr, int *out_tc) {
+    char opp = (player == 'R' ? 'B' : 'R');
+    char tmp[BOARD_N][BOARD_N];
+    for (int sr = 0; sr < BOARD_N; sr++) {
+        for (int sc = 0; sc < BOARD_N; sc++) {
+            if (bd[sr][sc] != player) continue;
+            // (1) Clone 후보
+            for (int d = 0; d < 8; d++) {
+                int tr = sr + dr8[d];
+                int tc = sc + dc8[d];
+                if (!in_bounds(tr, tc) || bd[tr][tc] != '.') continue;
+                memcpy(tmp, bd, sizeof(tmp));
+                apply_move(tmp, sr, sc, tr, tc, player);
+                // 4방향(가로, 세로, 대각)으로 5개 연속 검사
+                int directions[4][2] = {{0,1},{1,0},{1,1},{1,-1}};
+                for (int dir = 0; dir < 4; dir++) {
+                    int cnt = 1;
+                    int dr = directions[dir][0], dc = directions[dir][1];
+                    // 앞쪽
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr + dr*k;
+                        int cc = tc + dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != player) break;
+                        cnt++;
+                    }
+                    // 뒤쪽
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr - dr*k;
+                        int cc = tc - dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != player) break;
+                        cnt++;
+                    }
+                    if (cnt >= 5) {
+                        *out_sr = sr; *out_sc = sc;
+                        *out_tr = tr; *out_tc = tc;
+                        return 1;
                     }
                 }
-                printf("\n");
             }
-            // first_player 정보
-            cJSON *fp_item = cJSON_GetObjectItem(m, "first_player");
-            if (fp_item && cJSON_IsString(fp_item)) {
-                const char *fp = fp_item->valuestring;
-                my_color = (strcmp(fp, name) == 0) ? 'R' : 'B';
-                printf("First player: %s (내 색: %c)\n", fp, my_color);
-            }
-            // game_start에는 보통 board가 없으므로 경고만 출력
-            cJSON *board_arr = cJSON_GetObjectItem(m, "board");
-            if (board_arr && cJSON_IsArray(board_arr)) {
-                char bd[BOARD][BOARD + 1];
-                j2b(board_arr, bd);
-                print_board(bd);
-            } else {
-                fprintf(stderr, "[WARN] game_start에 'board'가 없습니다. 넘어갑니다.\n");
+            // (2) Jump 후보
+            for (int j = 0; j < 12; j++) {
+                int tr = sr + dr_jump[j];
+                int tc = sc + dc_jump[j];
+                if (!in_bounds(tr, tc) || bd[tr][tc] != '.') continue;
+                memcpy(tmp, bd, sizeof(tmp));
+                apply_move(tmp, sr, sc, tr, tc, player);
+                int directions[4][2] = {{0,1},{1,0},{1,1},{1,-1}};
+                for (int dir = 0; dir < 4; dir++) {
+                    int cnt = 1;
+                    int dr = directions[dir][0], dc = directions[dir][1];
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr + dr*k;
+                        int cc = tc + dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != player) break;
+                        cnt++;
+                    }
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr - dr*k;
+                        int cc = tc - dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != player) break;
+                        cnt++;
+                    }
+                    if (cnt >= 5) {
+                        *out_sr = sr; *out_sc = sc;
+                        *out_tr = tr; *out_tc = tc;
+                        return 1;
+                    }
+                }
             }
         }
-        // ────────────────────────────────────
-        // your_turn 메시지 처리: generate_move() 호출
-        // ────────────────────────────────────
-        else if (strcmp(tp2, "your_turn") == 0) {
-            cJSON *board_arr = cJSON_GetObjectItem(m, "board");
-            if (!board_arr || !cJSON_IsArray(board_arr)) {
-                fprintf(stderr, "[ERROR] your_turn에 'board' 배열이 없습니다.\n");
-                cJSON_Delete(m);
-                break;
-            }
-            char bd[BOARD][BOARD + 1];
-            j2b(board_arr, bd);
-            // (디버깅용) 현재 보드 출력
-            print_board(bd);
+    }
+    return 0;
+}
 
-            // ────────────────────────────────────
-            // (☆) generate_move() 호출
-            // ────────────────────────────────────
-            int sx, sy, tx, ty;
-            generate_move(bd, my_color, &sx, &sy, &tx, &ty);
-            if (sx < 0) {
-                // 둘 곳이 없는 경우 모두 -1로 설정
-                sx = sy = tx = ty = -1;
-            }
 
-            // JSON으로 move 메시지 전송 (1-based 좌표)
-            cJSON *mv = cJSON_CreateObject();
-            cJSON_AddStringToObject(mv, "type", "move");
-            cJSON_AddNumberToObject(mv, "sx", sx + 1);
-            cJSON_AddNumberToObject(mv, "sy", sy + 1);
-            cJSON_AddNumberToObject(mv, "tx", tx + 1);
-            cJSON_AddNumberToObject(mv, "ty", ty + 1);
-            send_json(fd, mv);
-            cJSON_Delete(mv);
-        }
-        // ────────────────────────────────────
-        // move_ok 메시지 처리 (상대 또는 내 수가 정상 처리된 경우)
-        // ────────────────────────────────────
-        else if (strcmp(tp2, "move_ok") == 0) {
-            cJSON *player_item = cJSON_GetObjectItem(m, "player");
-            cJSON *sx_item = cJSON_GetObjectItem(m, "sx");
-            cJSON *sy_item = cJSON_GetObjectItem(m, "sy");
-            cJSON *tx_item = cJSON_GetObjectItem(m, "tx");
-            cJSON *ty_item = cJSON_GetObjectItem(m, "ty");
-            if (player_item && sx_item && sy_item && tx_item && ty_item) {
-                printf("자동 수 (%s) : %d %d → %d %d\n",
-                       player_item->valuestring,
-                       sx_item->valueint, sy_item->valueint,
-                       tx_item->valueint, ty_item->valueint);
+// ──────────────────────────────────────────────────────────────────────────
+// 7) find_immediate_block_move: “상대가 한 수만 더 두면 내가 패배” 검사
+// ──────────────────────────────────────────────────────────────────────────
+int find_immediate_block_move(char bd[BOARD_N][BOARD_N], char player,
+                              int *out_sr, int *out_sc, int *out_tr, int *out_tc) {
+    char opp = (player == 'R' ? 'B' : 'R');
+    char tmp[BOARD_N][BOARD_N];
+    for (int sr = 0; sr < BOARD_N; sr++) {
+        for (int sc = 0; sc < BOARD_N; sc++) {
+            if (bd[sr][sc] != opp) continue;
+            // (1) Clone 후보로 상대 승리 탐색
+            for (int d = 0; d < 8; d++) {
+                int tr = sr + dr8[d];
+                int tc = sc + dc8[d];
+                if (!in_bounds(tr, tc) || bd[tr][tc] != '.') continue;
+                memcpy(tmp, bd, sizeof(tmp));
+                apply_move(tmp, sr, sc, tr, tc, opp);
+                int directions[4][2] = {{0,1},{1,0},{1,1},{1,-1}};
+                for (int dir = 0; dir < 4; dir++) {
+                    int cnt = 1;
+                    int dr = directions[dir][0], dc = directions[dir][1];
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr + dr*k;
+                        int cc = tc + dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != opp) break;
+                        cnt++;
+                    }
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr - dr*k;
+                        int cc = tc - dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != opp) break;
+                        cnt++;
+                    }
+                    if (cnt >= 5) {
+                        // (tr,tc)에 상대가 두면 즉시 승리 → 내 쪽 치기
+                        for (int sr2 = 0; sr2 < BOARD_N; sr2++) {
+                            for (int sc2 = 0; sc2 < BOARD_N; sc2++) {
+                                if (bd[sr2][sc2] != player) continue;
+                                int dist = abs(sr2 - tr) + abs(sc2 - tc);
+                                if (dist <= 2 && bd[tr][tc] == '.') {
+                                    *out_sr = sr2; *out_sc = sc2;
+                                    *out_tr = tr; *out_tc = tc;
+                                    return 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            cJSON *board_arr2 = cJSON_GetObjectItem(m, "board");
-            if (board_arr2 && cJSON_IsArray(board_arr2)) {
-                char bd2[BOARD][BOARD + 1];
-                j2b(board_arr2, bd2);
-                print_board(bd2);
+            // (2) Jump 후보로 상대 승리 탐색
+            for (int j = 0; j < 12; j++) {
+                int tr = sr + dr_jump[j];
+                int tc = sc + dc_jump[j];
+                if (!in_bounds(tr, tc) || bd[tr][tc] != '.') continue;
+                memcpy(tmp, bd, sizeof(tmp));
+                apply_move(tmp, sr, sc, tr, tc, opp);
+                int directions[4][2] = {{0,1},{1,0},{1,1},{1,-1}};
+                for (int dir = 0; dir < 4; dir++) {
+                    int cnt = 1;
+                    int dr = directions[dir][0], dc = directions[dir][1];
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr + dr*k;
+                        int cc = tc + dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != opp) break;
+                        cnt++;
+                    }
+                    for (int k = 1; k < 5; k++) {
+                        int rr = tr - dr*k;
+                        int cc = tc - dc*k;
+                        if (!in_bounds(rr, cc) || tmp[rr][cc] != opp) break;
+                        cnt++;
+                    }
+                    if (cnt >= 5) {
+                        for (int sr2 = 0; sr2 < BOARD_N; sr2++) {
+                            for (int sc2 = 0; sc2 < BOARD_N; sc2++) {
+                                if (bd[sr2][sc2] != player) continue;
+                                int dist = abs(sr2 - tr) + abs(sc2 - tc);
+                                if (dist <= 2 && bd[tr][tc] == '.') {
+                                    *out_sr = sr2; *out_sc = sc2;
+                                    *out_tr = tr; *out_tc = tc;
+                                    return 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        // ────────────────────────────────────
-        // invalid_move 메시지 처리
-        // ────────────────────────────────────
-        else if (strcmp(tp2, "invalid_move") == 0) {
-            cJSON *player_item = cJSON_GetObjectItem(m, "player");
-            const char *pl = (player_item && cJSON_IsString(player_item))
-                                  ? player_item->valuestring
-                                  : "UNKNOWN";
-            printf("! incorrect move (%s)\n", pl);
-        }
-        // ────────────────────────────────────
-        // game_over 메시지 처리
-        // ────────────────────────────────────
-        else if (strcmp(tp2, "game_over") == 0) {
-            cJSON *scores_obj = cJSON_GetObjectItem(m, "scores");
-            if (scores_obj && cJSON_IsObject(scores_obj)) {
-                cJSON *r_sc_item = cJSON_GetObjectItem(scores_obj, "Red");
-                cJSON *b_sc_item = cJSON_GetObjectItem(scores_obj, "Blue");
-                int r_sc = (r_sc_item && cJSON_IsNumber(r_sc_item)) ? r_sc_item->valueint : 0;
-                int b_sc = (b_sc_item && cJSON_IsNumber(b_sc_item)) ? b_sc_item->valueint : 0;
-                printf("=== score ===\nRed : %d\nBlue: %d\n승자: %s\n",
-                       r_sc, b_sc,
-                       (r_sc > b_sc) ? "Red" : (b_sc > r_sc) ? "Blue" : "무승부");
+    }
+    return 0;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 8) score_greedy_clone: 복제(Clone) 휴리스틱
+// ──────────────────────────────────────────────────────────────────────────
+double score_greedy_clone(char bd[BOARD_N][BOARD_N],
+                          int sr, int sc, int tr, int tc, char player) {
+    char opp = (player == 'R' ? 'B' : 'R');
+    double score = 0.0;
+
+    // 1) 즉시 뒤집힐 세균 개수
+    int gain = 0;
+    for (int d = 0; d < 8; d++) {
+        int rr = tr + dr8[d], cc = tc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == opp) gain++;
+    }
+    const double w_gain_clone = 10.0;
+    score += w_gain_clone * gain;
+
+    // 2) 연결망 강화 (Connectivity)
+    int conn = 0;
+    for (int d = 0; d < 8; d++) {
+        int rr = tr + dr8[d], cc = tc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == player) conn++;
+    }
+    const double w_conn_clone = 3.0;
+    score += w_conn_clone * conn;
+
+    // 3) 잠재 확장성 (Potential) — (tr,tc) 주변 + α*(sr,sc) 주변
+    int pot_tr = 0, pot_sr = 0;
+    for (int d = 0; d < 8; d++) {
+        int rr = tr + dr8[d], cc = tc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == '.') pot_tr++;
+    }
+    for (int d = 0; d < 8; d++) {
+        int rr = sr + dr8[d], cc = sc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == '.') pot_sr++;
+    }
+    const double w_pot_clone = 1.0;
+    const double alpha = 0.3;
+    score += w_pot_clone * (pot_tr + alpha * pot_sr);
+
+    // 4) 사각형 완성 패널티
+    int completes_sq = 0;
+    for (int br = tr - 1; br <= tr; br++) {
+        for (int bc = tc - 1; bc <= tc; bc++) {
+            if (br < 0 || bc < 0 || br + 1 >= BOARD_N || bc + 1 >= BOARD_N) continue;
+            int cnt = 0;
+            for (int dr = 0; dr < 2; dr++) {
+                for (int dc = 0; dc < 2; dc++) {
+                    int rr = br + dr, cc = bc + dc;
+                    if (rr == tr && cc == tc) cnt++;
+                    else if (bd[rr][cc] == player) cnt++;
+                }
             }
-            cJSON_Delete(m);
-            break;
+            if (cnt == 4) completes_sq = 1;
         }
-        // ────────────────────────────────────
-        // 그 외 알 수 없는 메시지는 무시
-        // ────────────────────────────────────
-        cJSON_Delete(m);
+    }
+    if (completes_sq) {
+        const double penalty_square_clone = 30.0;
+        score -= penalty_square_clone;
     }
 
-    close(fd);
+    // 5) 선형 연결 보너스 (Horizontal/Vertical)
+    int chain_h = 1, chain_v = 1;
+    // 가로 왼쪽
+    for (int cc = tc - 1; cc >= 0; cc--) {
+        if (bd[tr][cc] == player) chain_h++;
+        else break;
+    }
+    // 가로 오른쪽
+    for (int cc = tc + 1; cc < BOARD_N; cc++) {
+        if (bd[tr][cc] == player) chain_h++;
+        else break;
+    }
+    // 세로 위
+    for (int rr = tr - 1; rr >= 0; rr--) {
+        if (bd[rr][tc] == player) chain_v++;
+        else break;
+    }
+    // 세로 아래
+    for (int rr = tr + 1; rr < BOARD_N; rr++) {
+        if (bd[rr][tc] == player) chain_v++;
+        else break;
+    }
+    int chain_len = (chain_h > chain_v ? chain_h : chain_v);
+    if (chain_len >= 2) {
+        const double w_chain_clone = 2.0;
+        score += w_chain_clone * (chain_len - 1);
+    }
+
+    return score;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 9) score_greedy_jump: 점프(Jump) 휴리스틱
+// ──────────────────────────────────────────────────────────────────────────
+double score_greedy_jump(char bd[BOARD_N][BOARD_N],
+                         int sr, int sc, int tr, int tc, char player) {
+    char opp = (player == 'R' ? 'B' : 'R');
+    double score = 0.0;
+
+    // 1) 즉시 뒤집힐 세균 개수
+    int gain = 0;
+    for (int d = 0; d < 8; d++) {
+        int rr = tr + dr8[d], cc = tc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == opp) gain++;
+    }
+    const double w_gain_jump = 12.0;
+    score += w_gain_jump * gain;
+
+    // 2) 연결망 강화 (Connectivity)
+    int conn = 0;
+    for (int d = 0; d < 8; d++) {
+        int rr = tr + dr8[d], cc = tc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == player) conn++;
+    }
+    const double w_conn_jump = 2.0;
+    score += w_conn_jump * conn;
+
+    // 3) 잠재 확장성 (Potential) — (sr,sc) 주변은 빈 칸이 되므로 반영하지 않음
+    int pot_tr = 0;
+    for (int d = 0; d < 8; d++) {
+        int rr = tr + dr8[d], cc = tc + dc8[d];
+        if (in_bounds(rr, cc) && bd[rr][cc] == '.') pot_tr++;
+    }
+    const double w_pot_jump = 1.0;
+    score += w_pot_jump * pot_tr;
+
+    // 4) 사각형 완성 패널티 (더 크게)
+    int completes_sq = 0;
+    for (int br = tr - 1; br <= tr; br++) {
+        for (int bc = tc - 1; bc <= tc; bc++) {
+            if (br < 0 || bc < 0 || br + 1 >= BOARD_N || bc + 1 >= BOARD_N) continue;
+            int cnt = 0;
+            for (int dr = 0; dr < 2; dr++) {
+                for (int dc = 0; dc < 2; dc++) {
+                    int rr = br + dr, cc = bc + dc;
+                    if (rr == tr && cc == tc) cnt++;
+                    else if (bd[rr][cc] == player) cnt++;
+                }
+            }
+            if (cnt == 4) completes_sq = 1;
+        }
+    }
+    if (completes_sq) {
+        const double penalty_square_jump = 40.0;
+        score -= penalty_square_jump;
+    }
+
+    // 5) 선형 연결 보너스
+    int chain_h = 1, chain_v = 1;
+    // 가로 왼쪽
+    for (int cc = tc - 1; cc >= 0; cc--) {
+        if (bd[tr][cc] == player) chain_h++;
+        else break;
+    }
+    // 가로 오른쪽
+    for (int cc = tc + 1; cc < BOARD_N; cc++) {
+        if (bd[tr][cc] == player) chain_h++;
+        else break;
+    }
+    // 세로 위
+    for (int rr = tr - 1; rr >= 0; rr--) {
+        if (bd[rr][tc] == player) chain_v++;
+        else break;
+    }
+    // 세로 아래
+    for (int rr = tr + 1; rr < BOARD_N; rr++) {
+        if (bd[rr][tc] == player) chain_v++;
+        else break;
+    }
+    int chain_len = (chain_h > chain_v ? chain_h : chain_v);
+    if (chain_len >= 2) {
+        const double w_chain_jump = 2.5;
+        score += w_chain_jump * (chain_len - 1);
+    }
+
+    // 6) 구멍 리스크 패널티 (Jump 전용)
+    int risk = 0;
+    for (int d = 0; d < 8; d++) {
+        int rr = sr + dr8[d], cc = sc + dc8[d];
+        if (!in_bounds(rr, cc) || bd[rr][cc] != opp) continue;
+        for (int j = 0; j < 12; j++) {
+            int rm = rr + dr_jump[j], cm = cc + dc_jump[j];
+            if (!in_bounds(rm, cm) || bd[rm][cm] != '.') continue;
+            if (abs(rm - sr) + abs(cm - sc) <= 2) {
+                risk++;
+                break;
+            }
+        }
+    }
+    const double w_risk_jump = 5.0;
+    score -= w_risk_jump * risk;
+
+    return score;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 10) run_quick_mcts: 짧은 몬테카를로 시뮬레이션으로 승률 계산
+// ──────────────────────────────────────────────────────────────────────────
+double run_quick_mcts(char bd[BOARD_N][BOARD_N], char player,
+                      int sr, int sc, int tr, int tc, int sims) {
+    // (1) 후보를 가상 보드에 미리 적용
+    char tmp[BOARD_N][BOARD_N];
+    memcpy(tmp, bd, sizeof(tmp));
+    apply_move(tmp, sr, sc, tr, tc, player);
+
+    // (2) 다음 턴 색 결정
+    char turn_next = (player == 'R' ? 'B' : 'R');
+    int win_count = 0;
+
+    for (int i = 0; i < sims; i++) {
+        char sim_board[BOARD_N][BOARD_N];
+        memcpy(sim_board, tmp, sizeof(sim_board));
+        char turn = turn_next;
+        // (3) 간단한 랜덤/휴리스틱 플레이아웃
+        while (!is_terminal(sim_board)) {
+            int r_sr, r_sc, r_tr, r_tc;
+            pick_random_or_heuristic(sim_board, turn, &r_sr, &r_sc, &r_tr, &r_tc);
+            apply_move(sim_board, r_sr, r_sc, r_tr, r_tc, turn);
+            turn = (turn == 'R' ? 'B' : 'R');
+        }
+        // (4) 승자 판단
+        char winner = decide_winner(sim_board);
+        if (winner == player) win_count++;
+    }
+    return (double)win_count / sims;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 11) generate_move: “Clone/Jump 후보 3개씩 뽑아 6개를 MCTS 비교” 메인 로직
+// ──────────────────────────────────────────────────────────────────────────
+Move generate_move(char bd[BOARD_N][BOARD_N], char player) {
+    my_color = player;
+    opp_color = (player == 'R' ? 'B' : 'R');
+
+    Move best_move = { 0, 0, 0, 0, 'C' };
+
+    // 1) 즉시 승리(Immediate Win) 검사
+    {
+        int w_sr, w_sc, w_tr, w_tc;
+        if (find_immediate_win_move(bd, player, &w_sr, &w_sc, &w_tr, &w_tc)) {
+            int dist = abs(w_tr - w_sr) + abs(w_tc - w_sc);
+            char mtype = (dist == 1 ? 'C' : 'J');
+            best_move.sr = w_sr;
+            best_move.sc = w_sc;
+            best_move.tr = w_tr;
+            best_move.tc = w_tc;
+            best_move.move_type = mtype;
+            return best_move;
+        }
+    }
+
+    // 2) 즉시 패배 차단(Immediate Block) 검사
+    {
+        int b_sr, b_sc, b_tr, b_tc;
+        if (find_immediate_block_move(bd, player, &b_sr, &b_sc, &b_tr, &b_tc)) {
+            int dist = abs(b_tr - b_sr) + abs(b_tc - b_sc);
+            char mtype = (dist == 1 ? 'C' : 'J');
+            best_move.sr = b_sr;
+            best_move.sc = b_sc;
+            best_move.tr = b_tr;
+            best_move.tc = b_tc;
+            best_move.move_type = mtype;
+            return best_move;
+        }
+    }
+
+    // 3) 후보 생성 및 그리디 점수 계산 → Clone 후보 저장
+    MoveCandidate cloneCands[MAX_CANDS];
+    int n_clone = 0;
+
+    for (int sr = 0; sr < BOARD_N; sr++) {
+        for (int sc = 0; sc < BOARD_N; sc++) {
+            if (bd[sr][sc] != player) continue;
+            // (1) Clone 후보
+            for (int d = 0; d < 8; d++) {
+                int tr = sr + dr8[d];
+                int tc = sc + dc8[d];
+                if (!in_bounds(tr, tc) || bd[tr][tc] != '.') continue;
+                double score = score_greedy_clone(bd, sr, sc, tr, tc, player);
+                cloneCands[n_clone].sr = sr;
+                cloneCands[n_clone].sc = sc;
+                cloneCands[n_clone].tr = tr;
+                cloneCands[n_clone].tc = tc;
+                cloneCands[n_clone].score = score;
+                cloneCands[n_clone].move_type = 'C';
+                n_clone++;
+            }
+        }
+    }
+
+    // 4) 후보 생성 및 그리디 점수 계산 → Jump 후보 저장
+    MoveCandidate jumpCands[MAX_CANDS];
+    int n_jump = 0;
+
+    for (int sr = 0; sr < BOARD_N; sr++) {
+        for (int sc = 0; sc < BOARD_N; sc++) {
+            if (bd[sr][sc] != player) continue;
+            // (2) Jump 후보
+            for (int j = 0; j < 12; j++) {
+                int tr = sr + dr_jump[j];
+                int tc = sc + dc_jump[j];
+                if (!in_bounds(tr, tc) || bd[tr][tc] != '.') continue;
+                double score = score_greedy_jump(bd, sr, sc, tr, tc, player);
+                jumpCands[n_jump].sr = sr;
+                jumpCands[n_jump].sc = sc;
+                jumpCands[n_jump].tr = tr;
+                jumpCands[n_jump].tc = tc;
+                jumpCands[n_jump].score = score;
+                jumpCands[n_jump].move_type = 'J';
+                n_jump++;
+            }
+        }
+    }
+
+    // 5) 그리디 점수 기준 내림차순 정렬
+    int cmp_cand(const void *a, const void *b) {
+        double diff = ((MoveCandidate *)b)->score - ((MoveCandidate *)a)->score;
+        return (diff > 0 ? 1 : (diff < 0 ? -1 : 0));
+    }
+    if (n_clone > 0) qsort(cloneCands, n_clone, sizeof(MoveCandidate), cmp_cand);
+    if (n_jump  > 0) qsort(jumpCands,  n_jump,  sizeof(MoveCandidate), cmp_cand);
+
+    // 6) 상위 3개씩만 압축
+    int use_clone = (n_clone < TOP_K ? n_clone : TOP_K);
+    int use_jump  = (n_jump  < TOP_K ? n_jump  : TOP_K);
+
+    MoveCandidate pool[TOP_K * 2];
+    int pool_n = 0;
+    for (int i = 0; i < use_clone; i++) {
+        pool[pool_n++] = cloneCands[i];
+    }
+    for (int i = 0; i < use_jump; i++) {
+        pool[pool_n++] = jumpCands[i];
+    }
+
+    // 7) 몬테카를로 시뮬레이션 (후보당 SIMS_PER_CAND 회)
+    for (int i = 0; i < pool_n; i++) {
+        int sr = pool[i].sr;
+        int sc = pool[i].sc;
+        int tr = pool[i].tr;
+        int tc = pool[i].tc;
+        pool[i].winrate = run_quick_mcts(bd, player, sr, sc, tr, tc, SIMS_PER_CAND);
+    }
+
+    // 8) 승률 기준으로 최종 정렬
+    int cmp_wr(const void *a, const void *b) {
+        double diff = ((MoveCandidate *)b)->winrate - ((MoveCandidate *)a)->winrate;
+        return (diff > 0 ? 1 : (diff < 0 ? -1 : 0));
+    }
+    qsort(pool, pool_n, sizeof(MoveCandidate), cmp_wr);
+
+    // 9) 최종 수 선택
+    best_move.sr = pool[0].sr;
+    best_move.sc = pool[0].sc;
+    best_move.tr = pool[0].tr;
+    best_move.tc = pool[0].tc;
+    best_move.move_type = pool[0].move_type;
+    return best_move;
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// main() 예시: 기본적으로 무작위 초기 보드 → AI가 수 두기
+// (실제 네트워크/서버 통신 로직과 결합하여 사용하세요.)
+// ──────────────────────────────────────────────────────────────────────────
+int main() {
+    srand(time(NULL));
+
+    // 초기 보드: 모두 빈 칸('.')
+    for (int i = 0; i < BOARD_N; i++) {
+        for (int j = 0; j < BOARD_N; j++) {
+            board[i][j] = '.';
+        }
+    }
+    // 예시: 누가 먼저 시작할지 결정 (여기서는 R이 먼저 시작)
+    my_color = 'R';
+
+    // 실제 게임 루프: 턴마다 generate_move()로 수를 계산하고 apply_move() → 서버에 전송
+    // 여기서는 단순히 10턴 정도 AI가 혼자 두는 형태로 시연
+    for (int turn = 0; turn < 10; turn++) {
+        Move mv = generate_move(board, my_color);
+        printf("Turn %d: %c moves (%d,%d) -> (%d,%d) [%c]\n",
+                turn+1, my_color, mv.sr, mv.sc, mv.tr, mv.tc, mv.move_type);
+        apply_move(board, mv.sr, mv.sc, mv.tr, mv.tc, my_color);
+
+        // 보드 출력 (디버깅용)
+        for (int r = 0; r < BOARD_N; r++) {
+            for (int c = 0; c < BOARD_N; c++) {
+                printf("%c ", board[r][c]);
+            }
+            printf("\n");
+        }
+        printf("\n");
+
+        // 다음 턴 색 교체
+        my_color = (my_color == 'R' ? 'B' : 'R');
+    }
+
     return 0;
 }
