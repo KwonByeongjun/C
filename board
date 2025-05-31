@@ -1,137 +1,161 @@
-// ======================================
-// board.c
-// ======================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-#include <stdlib.h>
-#include <string.h>
+"""
+board_renderer.py
 
-#define BOARD 8
+Raspberry Pi RGB Matrix P3.0 64×64 모듈을 이용해, 8×8 백혈구 게임 보드를 표시하고
+“수 두기(update_cell)”만 호출하면 해당 칸만 효율적으로 업데이트해 주는 예제입니다.
 
-/**
- * 보드 범위(r,c)가 0 이상 BOARD-1 이하인지 검사
- */
-int inb(int r, int c) {
-    return (r >= 0 && r < BOARD && c >= 0 && c < BOARD);
-}
+- 각 칸은 8×8 픽셀로 매핑되어 있고,
+- 빈 칸: 검정(0,0,0) / 레드(내 백혈구): 빨강(255,0,0) / 블루(상대 세균): 파랑(0,0,255)
+- 그리드 선: 짙은 회색(50,50,50)으로 표시
+"""
 
-/**
- * (sr,sc) -> (dr,dc) 이동 거리를 Chebyshev 거리로 계산
- */
-int dist(int sr, int sc, int dr, int dc) {
-    int d1 = abs(dr - sr);
-    int d2 = abs(dc - sc);
-    return (d1 > d2) ? d1 : d2;
-}
+import sys
+import time
+from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
 
-/**
- * 보드 bd 에서, (sr,sc) 위치에 있는 말을 me('R' 또는 'B')가 (dr,dc)로 이동했을 때
- * - 이동(복제 or 점프) 규칙에 따라 실제 보드를 업데이트
- * - 복제(격차=1)인 경우: 원래 (sr,sc) 칸도 유지
- * - 점프(격차=2)인 경우: 원래 (sr,sc)을 빈칸('.')으로 만듦
- * - 그리고 이동 후, (dr,dc) 주변 8방향에 상대편 돌이 있으면 모두 내 돌로 뒤집음 
- */
-void apply_move(char bd[BOARD][BOARD+1], int sr, int sc, int dr, int dc, char me) {
-    int d = dist(sr, sc, dr, dc);
-    // 1) (dr,dc) 위치에 내 돌 찍기
-    bd[dr][dc] = me;
-    // 2) 점프(격차=2)라면 원래 위치를 빈칸으로
-    if (d == 2) {
-        bd[sr][sc] = '.';
-    }
-    // 3) 인접 8방향에 상대 돌이 있으면 뒤집기
-    for (int rr = -1; rr <= 1; ++rr) {
-        for (int cc = -1; cc <= 1; ++cc) {
-            if (rr == 0 && cc == 0) continue;
-            int nr = dr + rr;
-            int nc = dc + cc;
-            if (inb(nr, nc) && bd[nr][nc] != '.' && bd[nr][nc] != me) {
-                bd[nr][nc] = me;
-            }
-        }
-    }
-}
+# ===============================
+# 설정 옵션: Matrix 초기화
+# ===============================
+options = RGBMatrixOptions()
+options.rows = 64        # 패널 세로 픽셀 수
+options.cols = 64        # 패널 가로 픽셀 수
+options.chain_length = 1 # 패널 체인 수 (여기서는 1)
+options.parallel = 1     # 병렬 연결 수 (여기선 1)
+# 하드웨어 매핑: 사용 중인 Hat 종류에 따라 조정 ('adafruit-hat', 'adafruit-hat-pwm', 'regular' 등)
+options.hardware_mapping = 'adafruit-hat'
 
-/**
- * 현재 보드 bd 상의 돌 개수를 세어, 
- * 내 돌(me) 개수 - 상대 돌 개수 를 리턴
- */
-int score_diff(char bd[BOARD][BOARD+1], char me) {
-    int my = 0, op = 0;
-    char opp = (me == 'R') ? 'B' : 'R';
-    for (int r = 0; r < BOARD; ++r) {
-        for (int c = 0; c < BOARD; ++c) {
-            if (bd[r][c] == me)       ++my;
-            else if (bd[r][c] == opp) ++op;
-        }
-    }
-    return my - op;
-}
+matrix = RGBMatrix(options=options)
+canvas = matrix.CreateFrameCanvas()
+width = canvas.width   # 64
+height = canvas.height # 64
 
-/**
- * generate_move:
- *   현재 보드 bd 와 내 색(me)이 주어졌을 때,
- *   가능한 모든 이동을 시뮬레이션한 뒤
- *   "score_diff"가 가장 큰 이동을 찾아서 (sx,sy)->(tx,ty) 로 리턴.
- *   만약 둘 수 있는 곳이 하나도 없으면 sx=-1 으로 표시.
- *   동점일 경우 약간의 무작위성을 넣어 균형 잡음 (rand()%2 == 1).
- *
- *   - bd:   현재 8×8 보드 (각 행은 null-terminated 문자열, 길이는 8)
- *   - me:   'R' 또는 'B'
- *   - sx,sy,tx,ty: 이동 전/후 좌표(0-based row/col)를 리턴
- */
-void generate_move(char bd[BOARD][BOARD+1], char me, int *sx, int *sy, int *tx, int *ty) {
-    int best_sx = -1, best_sy = -1, best_tx = -1, best_ty = -1;
-    int best_sc = -1000;  // 초기값을 충분히 낮게 잡음
+# ===============================
+# 게임 보드 변수
+# ===============================
+BOARD_SIZE = 8            # 논리적 보드 크기
+CELL_PIX = width // BOARD_SIZE  # 칸당 픽셀 크기 = 8
 
-    // 1) 보드 전체 순회하며, 내 돌(me)이 있는 위치 (sr,sc)를 찾는다
-    for (int sr = 0; sr < BOARD; ++sr) {
-        for (int sc = 0; sc < BOARD; ++sc) {
-            if (bd[sr][sc] != me) continue;
+# 8×8 보드 상태 저장: '.'(빈), 'R'(레드), 'B'(블루)
+board = [['.' for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
 
-            // 2) 그 돌에서 dr,dc ∈ [-2..2] 범위로 이동 가능한지 확인
-            for (int dr = -2; dr <= 2; ++dr) {
-                for (int dc = -2; dc <= 2; ++dc) {
-                    int tr = sr + dr;
-                    int tc = sc + dc;
-                    //  - 보드 안에 들어오는지
-                    //  - dr==0 && dc==0 은 이동이 아니므로 skip
-                    //  - dist(sr,sc → tr,tc) > 2 이면 skip
-                    if (!inb(tr, tc) || (dr == 0 && dc == 0) || dist(sr, sc, tr, tc) > 2)
-                        continue;
-                    //  - 직선, 대각선 방향이 아니면 skip
-                    if (!(dr == 0 || dc == 0 || abs(dr) == abs(dc)))
-                        continue;
-                    //  - 목표 칸이 빈칸('.')이 아닌 경우 skip
-                    if (bd[tr][tc] != '.')
-                        continue;
+# 색상 정의
+COLOR_EMPTY = graphics.Color(0, 0, 0)        # 빈 칸 = 검정
+COLOR_RED   = graphics.Color(255, 0, 0)      # 레드 = 빨강
+COLOR_BLUE  = graphics.Color(0, 0, 255)      # 블루 = 파랑
+COLOR_GRID  = graphics.Color(50, 50, 50)     # 그리드 선 = 짙은 회색
 
-                    // 3) 실제 이동을 시뮬레이션 (임시 보드에 복사 후 apply_move)
-                    char tmp[BOARD][BOARD + 1];
-                    memcpy(tmp, bd, sizeof(tmp));
-                    apply_move(tmp, sr, sc, tr, tc, me);
+# ===============================
+# 보드 전체를 한 번 그리는 함수
+# ===============================
+def draw_full_board():
+    """
+    board[][] 상태를 토대로 캔버스 전체(64×64)를 다시 그립니다.
+    1) 전체를 검정으로 지운 뒤
+    2) 각 칸(cell)에 대응하는 8×8 블록을 채우고
+    3) 그리드 선(칸 경계)을 그립니다.
+    """
+    # 1) 전체 Clear
+    canvas.Fill(0, 0, 0)
 
-                    // 4) apply_move 후, score_diff 계산
-                    int diff = score_diff(tmp, me);
+    # 2) 칸별 색 채우기
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            x0 = c * CELL_PIX
+            y0 = r * CELL_PIX
+            ch = board[r][c]
+            if ch == 'R':
+                _fill_cell(x0, y0, COLOR_RED)
+            elif ch == 'B':
+                _fill_cell(x0, y0, COLOR_BLUE)
+            # 빈 칸은 검정(0,0,0)으로 이미 초기화되어 있음
 
-                    // 5) 최댓값으로 갱신
-                    if (diff > best_sc) {
-                        best_sc = diff;
-                        best_sy = sr; best_sx = sc;
-                        best_ty = tr; best_tx = tc;
-                    }
-                    // 6) 동점일 때 약간의 랜덤 요소
-                    else if (diff == best_sc && (rand() % 2 == 1)) {
-                        best_sy = sr; best_sx = sc;
-                        best_ty = tr; best_tx = tc;
-                    }
-                }
-            }
-        }
-    }
+    # 3) 그리드 선(칸 경계) 그리기
+    for i in range(BOARD_SIZE + 1):
+        y = i * CELL_PIX
+        x = i * CELL_PIX
+        # 가로선: (x=0..63, y=i*8)
+        canvas.DrawLine(0, y, width - 1, y, COLOR_GRID)
+        # 세로선: (x=i*8, y=0..63)
+        canvas.DrawLine(x, 0, x, height - 1, COLOR_GRID)
 
-    // 만약 이동 가능한 게 하나도 없으면 best_sx == -1 상태 그대로
-    *sx = best_sx;
-    *sy = best_sy;
-    *tx = best_tx;
-    *ty = best_ty;
-}
+    # 화면에 반영
+    matrix.SwapOnVSync(canvas)
+
+# ===============================
+# 단일 칸만 업데이트하는 함수
+# ===============================
+def update_cell(row, col, ch):
+    """
+    특정 (row, col)에 ch('R'/'B'/'.')를 놓고, 해당 위치(8×8 픽셀 블록)만 갱신.
+    """
+    # 1) board 상태 갱신
+    board[row][col] = ch
+
+    # 2) 해당 칸 픽셀 좌표 계산
+    x0 = col * CELL_PIX
+    y0 = row * CELL_PIX
+
+    # 3) 칸 8×8 영역을 지우고(검정) → 새로운 색으로 채우기
+    if ch == 'R':
+        _fill_cell(x0, y0, COLOR_RED)
+    elif ch == 'B':
+        _fill_cell(x0, y0, COLOR_BLUE)
+    else:
+        _fill_cell(x0, y0, COLOR_EMPTY)
+
+    # 4) 해당 칸 경계선 다시 그리기 (심플하게 상단/좌측/우측/하단 모두 그려도 무방)
+    x1 = x0 + CELL_PIX - 1
+    y1 = y0 + CELL_PIX - 1
+    # 상단
+    canvas.DrawLine(x0, y0, x1, y0, COLOR_GRID)
+    # 좌측
+    canvas.DrawLine(x0, y0, x0, y1, COLOR_GRID)
+    # 우측
+    canvas.DrawLine(x1, y0, x1, y1, COLOR_GRID)
+    # 하단
+    canvas.DrawLine(x0, y1, x1, y1, COLOR_GRID)
+
+    # 5) 화면에 즉시 반영
+    matrix.SwapOnVSync(canvas)
+
+# ===============================
+# 헬퍼: 칸 채우기
+# ===============================
+def _fill_cell(x0, y0, color):
+    """
+    (x0, y0) 좌상단부터 CELL_PIX × CELL_PIX 영역을 color로 채움.
+    """
+    for dy in range(CELL_PIX):
+        for dx in range(CELL_PIX):
+            canvas.SetPixel(x0 + dx, y0 + dy, color.red, color.green, color.blue)
+
+# ===============================
+# 메인 예시: 전체 그리기 + 무작위 수 두기
+# ===============================
+if __name__ == "__main__":
+    try:
+        # 1) 초기 보드 전체 그리기
+        draw_full_board()
+
+        # 2) 예시 루프: 1초마다 무작위 빈 칸에 R/B 순서대로 두기
+        import random
+        turn = 0
+        while True:
+            time.sleep(1.0)
+            r = random.randint(0, BOARD_SIZE - 1)
+            c = random.randint(0, BOARD_SIZE - 1)
+            if board[r][c] != '.':
+                continue
+            if turn % 2 == 0:
+                update_cell(r, c, 'R')
+            else:
+                update_cell(r, c, 'B')
+            turn += 1
+
+    except KeyboardInterrupt:
+        # Ctrl+C로 종료 시 캔버스 초기화 후 종료
+        canvas.Clear()
+        sys.exit(0)
