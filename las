@@ -1,65 +1,19 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "server.h"
-#include "client.h"
-#include "board.h"
-
-// 필요에 따라 port/ip/username 파싱은 기존 방식에 맞게 조정!
-
-void print_usage(const char *prog) {
-    printf("Usage:\n");
-    printf("  %s server -p <port>\n", prog);
-    printf("  %s client -i <ip> -p <port> -u <username>\n", prog);
-}
-
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    if (strcmp(argv[1], "server") == 0) {
-        // ---- SERVER 모드 ----
-        int port = 8080;  // 기본값, 실제로는 인자 파싱 필요
-        for (int i = 2; i < argc; ++i) {
-            if (strcmp(argv[i], "-p") == 0 && i + 1 < argc)
-                port = atoi(argv[++i]);
-        }
-
-        // ** server에서만 LED 초기화/해제 **
-        if (init_led_matrix(&argc, &argv) < 0) {
-            fprintf(stderr, "Failed to initialize LED Matrix.\n");
-            return EXIT_FAILURE;
-        }
-        int ret = server_run(port);
-        close_led_matrix();
-        return ret;
-
-    } else if (strcmp(argv[1], "client") == 0) {
-        // ---- CLIENT 모드 ----
-        char *ip = NULL;
-        int port = 8080;
-        char *username = NULL;
-
-        for (int i = 2; i < argc; ++i) {
-            if (strcmp(argv[i], "-i") == 0 && i + 1 < argc)
-                ip = argv[++i];
-            else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc)
-                port = atoi(argv[++i]);
-            else if (strcmp(argv[i], "-u") == 0 && i + 1 < argc)
-                username = argv[++i];
-        }
-        if (!ip || !username) {
-            print_usage(argv[0]);
-            return EXIT_FAILURE;
-        }
-
-        // ** client에서는 LED 관련 함수 호출 절대 금지 **
-        return client_run(ip, port, username);
-
-    } else {
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-}
+kwon@raspberrypi:~/real_real/System-Programming-OctaFlip/hw3_202311160 $ g++ -Iinclude -Ilibs/rpi-rgb-led-matrix/include main.c src/server.c src/client.c src/board.c src/game.c src/json.c libs/cJSON.c -Llibs/rpi-rgb-led-matrix/lib -lrgbmatrix -lpthread -lrt -o hw3
+main.c: In function ‘int main(int, char**)’:
+main.c:35:30: error: invalid conversion from ‘int’ to ‘const char*’ [-fpermissive]
+   35 |         int ret = server_run(port);
+      |                              ^~~~
+      |                              |
+      |                              int
+In file included from main.c:4:
+include/server.h:26:28: note:   initializing argument 1 of ‘int server_run(const char*)’
+   26 | int server_run(const char *port);
+      |                ~~~~~~~~~~~~^~~~
+main.c:59:31: error: invalid conversion from ‘int’ to ‘const char*’ [-fpermissive]
+   59 |         return client_run(ip, port, username);
+      |                               ^~~~
+      |                               |
+      |                               int
+In file included from main.c:5:
+include/client.h:8:44: note:   initializing argument 2 of ‘int client_run(const char*, const char*, const char*)’
+    8 | int client_run(const char *ip, const char *port, const char *username);
